@@ -16,7 +16,6 @@ jobs:
 
       - name: Extract 7z Archive
         run: |
-          # 假设压缩包名为 source.7z，若不是请修改
           7z x source.7z -o. -y
           echo "=== 解压后的目录结构 ==="
           ls -la
@@ -32,29 +31,64 @@ jobs:
           echo "✅ 项目目录: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
 
-      - name: Apply Kotlin source patches (自动修复已知错误)
+      - name: Apply Kotlin source patches (Python)
         run: |
           PROJECT_DIR="${{ steps.find_project.outputs.project_dir }}"
           TARGET="$PROJECT_DIR/app/src/main/java/io/legado/app/ui/book/source/manage/BookSourceActivity.kt"
           
-          echo "正在修复 $TARGET"
-          
-          # 1. 修复 alert 调用：titleResource → title
-          sed -i 's/alert(titleResource = "深度校验", messageResource = "将检测章节内容是否为拼接\/抄袭小说\\n此过程可能需要较长时间")/alert(title = "深度校验", message = "将检测章节内容是否为拼接\/抄袭小说\\n此过程可能需要较长时间")/' "$TARGET"
-          
+          python3 << 'EOF'
+          import re
+          import sys
+
+          target_file = sys.argv[1] if len(sys.argv) > 1 else exit(1)
+
+          with open(target_file, 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          # 1. 修复 alert 调用：将 titleResource 改为 title
+          # 匹配 alert(titleResource = "深度校验", messageResource = "将检测章节内容是否为拼接/抄袭小说\n此过程可能需要较长时间")
+          # 替换为 alert(title = "深度校验", message = "...")
+          pattern1 = r'(alert\()titleResource\s*=\s*"深度校验"\s*,\s*messageResource\s*=\s*"将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间"\s*\)'
+          replacement1 = r'\1title = "深度校验", message = "将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间")'
+          content, count1 = re.subn(pattern1, replacement1, content)
+
           # 2. 修复 applyTint 颜色问题（如果 primaryTextColor 是 String）
-          #    检查是否已存在 Color.parseColor，若无则替换
-          if ! grep -q "Color.parseColor" "$TARGET"; then
-            sed -i '/searchView.applyTint(primaryTextColor)/c\        val colorInt = try { Color.parseColor(primaryTextColor) } catch (e: IllegalArgumentException) { primaryColor }\n        searchView.applyTint(colorInt)' "$TARGET"
-            # 确保 import android.graphics.Color 存在
-            if ! grep -q "import android.graphics.Color" "$TARGET"; then
-              sed -i '/^import android.graphics.Color/d' "$TARGET"
-              sed -i '1,/^import/ s/^import/import android.graphics.Color\nimport/' "$TARGET"
-            fi
-          fi
-          
-          echo "修复完成。显示修改后的相关行："
-          grep -n -A2 -B2 "深度校验" "$TARGET" || true
+          #    查找 searchView.applyTint(primaryTextColor) 并替换
+          pattern2 = r'searchView\.applyTint\(primaryTextColor\)'
+          replacement2 = '''val colorInt = try { Color.parseColor(primaryTextColor) } catch (e: IllegalArgumentException) { primaryColor }
+          searchView.applyTint(colorInt)'''
+          content, count2 = re.subn(pattern2, replacement2, content)
+
+          # 如果上面两种替换都没有发生，可能是格式略有不同，我们再用更宽松的模式尝试
+          if count1 == 0:
+              # 尝试匹配 alert( 后紧跟 titleResource
+              pattern1_alt = r'alert\(titleResource\s*=\s*"深度校验",\s*messageResource\s*=\s*"将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间"\)'
+              replacement1_alt = 'alert(title = "深度校验", message = "将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间")'
+              content, count1 = re.subn(pattern1_alt, replacement1_alt, content)
+
+          if count2 == 0:
+              # 可能已经修复过，但以防万一
+              pass
+
+          # 确保 import android.graphics.Color 存在
+          if 'import android.graphics.Color' not in content:
+              # 在第一个 import 之后插入
+              lines = content.split('\n')
+              import_index = 0
+              for i, line in enumerate(lines):
+                  if line.strip().startswith('import ') and 'android.graphics.Color' not in line:
+                      import_index = i + 1
+                      break
+              lines.insert(import_index, 'import android.graphics.Color')
+              content = '\n'.join(lines)
+
+          with open(target_file, 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          print(f"Patched file {target_file}")
+          print(f"  - alert fix applied: {count1 > 0}")
+          print(f"  - applyTint fix applied: {count2 > 0}")
+          EOF
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
