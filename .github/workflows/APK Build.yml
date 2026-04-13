@@ -16,79 +16,86 @@ jobs:
 
       - name: Extract 7z Archive
         run: |
+          # 假设压缩包名为 source.7z，如果不是请修改
           7z x source.7z -o. -y
-          echo "=== 解压后的目录结构 ==="
+          echo "=== 解压后根目录内容 ==="
           ls -la
+
+      - name: Debug - List all settings.gradle files
+        run: |
+          echo "=== 查找所有 settings.gradle 文件 ==="
+          find . -name "settings.gradle" -o -name "settings.gradle.kts" | head -20
 
       - name: Find Android Project Root
         id: find_project
         run: |
-          PROJECT_DIR=$(find . -maxdepth 3 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) -printf "%h\n" | head -1)
+          # 查找包含 settings.gradle 的目录，优先选择路径中包含 "legado" 的
+          PROJECT_DIR=$(find . -type f -name "settings.gradle" -printf "%h\n" | grep -i "legado" | head -1)
           if [ -z "$PROJECT_DIR" ]; then
-            echo "❌ 未找到 Gradle 项目目录！"
+            PROJECT_DIR=$(find . -type f -name "settings.gradle" -printf "%h\n" | head -1)
+          fi
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "❌ 未找到 settings.gradle 文件"
             exit 1
           fi
-          echo "✅ 项目目录: $PROJECT_DIR"
+          echo "✅ 确定的项目根目录: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
 
-      - name: Apply Kotlin source patches (Python)
+      - name: Debug - Show project directory structure
+        run: |
+          PROJECT_DIR="${{ steps.find_project.outputs.project_dir }}"
+          echo "=== 项目根目录内容 ==="
+          ls -la "$PROJECT_DIR"
+          echo "=== app 模块是否存在 ==="
+          ls -la "$PROJECT_DIR/app" || echo "app 目录不存在"
+
+      - name: Apply Source Patches (修复编译错误)
         run: |
           PROJECT_DIR="${{ steps.find_project.outputs.project_dir }}"
           TARGET="$PROJECT_DIR/app/src/main/java/io/legado/app/ui/book/source/manage/BookSourceActivity.kt"
           
-          python3 << 'EOF'
-          import re
-          import sys
+          echo "目标修复文件: $TARGET"
+          
+          # 如果文件不存在，尝试其他可能的路径
+          if [ ! -f "$TARGET" ]; then
+            echo "⚠️ 标准路径下未找到文件，尝试查找 BookSourceActivity.kt..."
+            TARGET=$(find "$PROJECT_DIR" -name "BookSourceActivity.kt" | head -1)
+            if [ -z "$TARGET" ]; then
+              echo "❌ 未找到 BookSourceActivity.kt，跳过修复"
+              exit 0
+            fi
+            echo "找到文件: $TARGET"
+          fi
+          
+          # 备份原文件以便调试
+          cp "$TARGET" "$TARGET.bak"
+          
+          # 1. 修复 alert 调用：titleResource → title
+          sed -i 's/alert(titleResource = "深度校验", messageResource = "将检测章节内容是否为拼接\/抄袭小说\\n此过程可能需要较长时间")/alert(title = "深度校验", message = "将检测章节内容是否为拼接\/抄袭小说\\n此过程可能需要较长时间")/g' "$TARGET"
+          
+          # 2. 修复 applyTint 颜色问题
+          if ! grep -q "Color.parseColor(primaryTextColor)" "$TARGET"; then
+            sed -i 's/searchView\.applyTint(primaryTextColor)/val colorInt = try { Color.parseColor(primaryTextColor) } catch (e: IllegalArgumentException) { primaryColor }\n        searchView.applyTint(colorInt)/g' "$TARGET"
+            if ! grep -q "import android.graphics.Color" "$TARGET"; then
+              sed -i '/^import android\./i import android.graphics.Color' "$TARGET"
+            fi
+          fi
+          
+          echo "修复完成。文件差异如下："
+          diff -u "$TARGET.bak" "$TARGET" || true
 
-          target_file = sys.argv[1] if len(sys.argv) > 1 else exit(1)
-
-          with open(target_file, 'r', encoding='utf-8') as f:
-              content = f.read()
-
-          # 1. 修复 alert 调用：将 titleResource 改为 title
-          # 匹配 alert(titleResource = "深度校验", messageResource = "将检测章节内容是否为拼接/抄袭小说\n此过程可能需要较长时间")
-          # 替换为 alert(title = "深度校验", message = "...")
-          pattern1 = r'(alert\()titleResource\s*=\s*"深度校验"\s*,\s*messageResource\s*=\s*"将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间"\s*\)'
-          replacement1 = r'\1title = "深度校验", message = "将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间")'
-          content, count1 = re.subn(pattern1, replacement1, content)
-
-          # 2. 修复 applyTint 颜色问题（如果 primaryTextColor 是 String）
-          #    查找 searchView.applyTint(primaryTextColor) 并替换
-          pattern2 = r'searchView\.applyTint\(primaryTextColor\)'
-          replacement2 = '''val colorInt = try { Color.parseColor(primaryTextColor) } catch (e: IllegalArgumentException) { primaryColor }
-          searchView.applyTint(colorInt)'''
-          content, count2 = re.subn(pattern2, replacement2, content)
-
-          # 如果上面两种替换都没有发生，可能是格式略有不同，我们再用更宽松的模式尝试
-          if count1 == 0:
-              # 尝试匹配 alert( 后紧跟 titleResource
-              pattern1_alt = r'alert\(titleResource\s*=\s*"深度校验",\s*messageResource\s*=\s*"将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间"\)'
-              replacement1_alt = 'alert(title = "深度校验", message = "将检测章节内容是否为拼接/抄袭小说\\n此过程可能需要较长时间")'
-              content, count1 = re.subn(pattern1_alt, replacement1_alt, content)
-
-          if count2 == 0:
-              # 可能已经修复过，但以防万一
-              pass
-
-          # 确保 import android.graphics.Color 存在
-          if 'import android.graphics.Color' not in content:
-              # 在第一个 import 之后插入
-              lines = content.split('\n')
-              import_index = 0
-              for i, line in enumerate(lines):
-                  if line.strip().startswith('import ') and 'android.graphics.Color' not in line:
-                      import_index = i + 1
-                      break
-              lines.insert(import_index, 'import android.graphics.Color')
-              content = '\n'.join(lines)
-
-          with open(target_file, 'w', encoding='utf-8') as f:
-              f.write(content)
-
-          print(f"Patched file {target_file}")
-          print(f"  - alert fix applied: {count1 > 0}")
-          print(f"  - applyTint fix applied: {count2 > 0}")
-          EOF
+      - name: Debug - Show actual code around line 290-300
+        run: |
+          PROJECT_DIR="${{ steps.find_project.outputs.project_dir }}"
+          TARGET="$PROJECT_DIR/app/src/main/java/io/legado/app/ui/book/source/manage/BookSourceActivity.kt"
+          if [ ! -f "$TARGET" ]; then
+            TARGET=$(find "$PROJECT_DIR" -name "BookSourceActivity.kt" | head -1)
+          fi
+          echo "=== 实际编译文件: $TARGET ==="
+          echo "=== 第 290-305 行内容 ==="
+          sed -n '290,305p' "$TARGET"
+          echo "=== 检查是否还包含 titleResource = \"深度校验\" ==="
+          grep -n "titleResource.*深度校验" "$TARGET" || echo "✅ 未找到，修复成功"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -109,11 +116,11 @@ jobs:
             gradle assembleAppDebug --build-cache --parallel --warning-mode all -x lint
           fi
 
-      - name: Organize the Files
+      - name: Collect APK files
         run: |
           mkdir -p ${{ github.workspace }}/apk/
           find ${{ steps.find_project.outputs.project_dir }} -type f -path "*/build/outputs/apk/*" -name "*.apk" -exec cp {} ${{ github.workspace }}/apk/ \;
-          echo "APK files copied:"
+          echo "APK files collected:"
           ls -l ${{ github.workspace }}/apk/
 
       - name: Upload APK
